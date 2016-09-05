@@ -3,8 +3,9 @@ defmodule Marc do
   # Abstract MARC21 library for Elixir
 
   Bare-bones MARC routines for dealing with library MARC
-  records in the most common format (single-char indicators,
-  three-character tags, single-char subfield codes, all UTF-8)
+  records in the most common format I deal with
+  (single-char indicators, three-character tags, single-char
+  subfield codes, all UTF-8).
   """
 
 
@@ -45,44 +46,80 @@ defmodule Marc do
       r.fields
     end
 
-    def fields(r, filter) when is_list(filter) do
-      Enum.filter(r.fields, fn(f) -> Enum.any?(filter, &(Marc.Field.tag(f) == &1)) end)
+    defp matches_at_least_one(field, tags) do
+      Enum.any? tags, fn(x) -> field.tag == x end
     end
 
-    def fields(r, str) when is_binary(str) do
-      fields(r, [str])
+    def fields(r, tags) when is_list(tags) do
+      r.fields
+        |> Enum.filter(fn(f) -> matches_at_least_one(f, tags) end)
+    end
+
+    def fields(r, tag) when is_binary(tag) do
+      fields(r, [tag])
+    end
+
+    def values(record, tag) when is_binary(tag) do
+      record
+        |> Record.fields(tag)
+        |> Enum.map(&Marc.Field.value/1)
+    end
+
+    def value(record, tag) when is_binary(tag) do
+      record
+        |> values(tag)
+        |> List.first || ""
     end
 
   end
 
   defprotocol Field do
-    @doc "Return string value of field"
+    @doc """
+    Return the value(s) of the field as a single string.
+    For Control fields, just return the value. For DataFields,
+    return a join of all the values of all the subfields (in order).
+    The default join character is a single space, but you can pass
+    one if you'd like.
+
+    ## Examples
+
+    Get the title
+        record |> Marc.Record.find("245") |> Marc.Field.value
+
+    Get a list of all values, with pipes between multiple subfield values
+
+        record |> Marc.Record.fields |> Enum.map(&Marc.Field.value(&1, "|"))
+    """
+    def tag(field)
     def value(field)
+    def value(field, joiner)
 
     @doc "Report the field type"
     def type(field)
-
-    @doc "Use a default implementation for tag"
-    defdelegate tag(field), to: Field.Util
   end
 
-  @doc "Default implementation of `tag(field)`"
-  defmodule  Field.Util do
-    def tag(f), do: f.tag
 
-  end
-
-  @doc "A ControlField -- just a tag and a value"
   defmodule ControlField do
+    @moduledoc """
+    A ControlField -- just a tag and a value
+    """
     defstruct tag: nil, value: nil
 
     defimpl Field, for: ControlField do
-      @derive Field
-      def value(f) do
+      @doc """
+      Value of the field.
+      """
+
+      def value(f, joiner \\ nil) do
         f.value
       end
 
-      @doc "Type is :control"
+      @doc """
+      Get the tag of the controlfield
+      """
+      def tag(f), do: f.tag
+
+      @doc "Type is always :control"
       def type(f), do: :control
     end
 
@@ -90,39 +127,140 @@ defmodule Marc do
   end
 
   defmodule SubField do
-    defstruct code: nil, value: nil
-    def code(sf), do: sf.code
-    def value(sf), do: sf.value
+    @moduledoc """
+    Subfield -- just a one-character code and a value.
+    Note that subfields can repeat within a tag. This
+    makes the list of subfields a straight-up KeywordList
+    """
+    def new(code, value) do
+      {code, value}
+    end
+
+    def code(sf), do: elem(sf, 0)
+    def value(sf), do: elem(sf, 1)
+
+    def matches_one_of(sf, codes) do
+      Enum.any?(codes, fn(c) -> c == SubField.code(sf) end)
+    end
 
   end
 
   defmodule DataField do
+    @moduledoc """
+    A DataField consists of a tag (like a control field),
+    two "indicators" (blank or a single digit) and an
+    ordered set of key-value pairs (the subfields).
+    """
     defstruct tag: nil, ind1: nil, ind2: nil, subfields: []
 
+
     defimpl Field, for: DataField do
-      @derive Field
-      def value(f) do
-        f.subfields |> Enum.map(&(&1.value)) |> Enum.join(" ")
+      @doc """
+      The default value of a datafield is the values of all the
+      subfields joined with spaces. You can pass in a joiner if you'd
+      like.
+      """
+      def value(f, joiner \\ " ") do
+        f.subfields
+          |> Keyword.values
+          |> Enum.join(joiner)
       end
 
       @doc "Type is :data"
       def type(f), do: :data
-
     end
 
-    @doc "Return the value of the first subfield that matches the tag"
-    def subfieldValue(f, code) do
-      f.subfields |> Enum.find(&(&1.code == code)) |> Marc.SubField.value
+    @doc """
+    Return a list of the subfields
+    """
+
+    def subfields(datafield), do: datafield.subfields
+
+    @doc """
+    Return a list of the subfields that match
+    any of the list of codes given
+    """
+
+    def subfields(datafield, codes) when is_list(codes) do
+      datafield
+        |> DataField.subfields
+        |> Enum.filter(fn(sf) -> SubField.matches_one_of(sf, codes) end)
     end
+
+    @doc """
+    Return a list of all subfields that have the given code
+    """
+    def subfields(datafield, code) do
+      subfields(datafield, [code])
+    end
+
+
+    @doc """
+    Return the value of the first subfield that matches the code.
+    If the code doesn't exist, return an empty string
+    or the supplied default
+    """
+    def firstValue(datafield, code, default \\ "") do
+      datafield
+        |> DataField.subfields
+        |> Keyword.get(code, default)
+    end
+
+    @doc """
+    Get all values of all the subfields, in order, as a list
+    """
+    def values(f) do
+      f
+        |> DataField.subfields
+        |> Enum.map(&SubField.value/1)
+    end
+
+    @doc """
+    Get values for any of the codes, in order,
+    in a list.
+    """
+    def values(datafield, codes) when is_list(codes) do
+      datafield
+        |> DataField.subfields(codes)
+        |> Enum.map(&SubField.value/1)
+    end
+
+    @doc """
+    Get values for a single code, as a list
+    """
+    def values(datafield, code) do
+      values(datafield, [code])
+    end
+
+
+    @doc """
+    Get values that match the code as a list
+    """
+    def values(f, code) do
+      Keyword.get_values(f, code)
+    end
+
+
 
   end
 
 
 
   defmodule MIJStream do
+    @moduledoc """
+    Given the filename of a file with one marc-in-json
+    record per line, produce a stream of records
+    """
+
+    defp singleMapToKV(m) do
+      tag = m |> Map.keys |> List.first
+      value = m |> Map.values |> List.first
+      {tag, value}
+    end
 
       def open(filename) do
-        File.stream!(filename)
+        filename
+          |> File.stream!
           |> Stream.map(&Poison.decode/1)
           |> Stream.map(&toRecord/1)
       end
@@ -140,8 +278,7 @@ defmodule Marc do
 
       @doc "Turn an MIJ fieldspec into a controlfield or datafield"
       def toField(m) do
-        tag = Map.keys(m) |> List.first
-        value = Map.values(m) |> List.first
+        {tag, value} = singleMapToKV(m)
         toField(tag, value)
       end
 
@@ -158,10 +295,18 @@ defmodule Marc do
 
       @doc "Turn an MIJ subfield into a SubField"
       def toSubField(m) do
-        code = Map.keys(m) |> List.first
-        value = Map.values(m) |> List.first
-        %Marc.SubField{code: code, value: value}
+        {code, value} = singleMapToKV(m)
+        Marc.SubField.new(code, value)
       end
 
     end
   end
+
+# IO.puts "Starting..."
+# count = "10k.json"
+#   |> Marc.MIJStream.open
+#   |> Stream.map(&Marc.Record.find(&1, "245"))
+#   |> Stream.map(&Marc.Field.value/1)
+#   |> Enum.count
+#
+# IO.puts "Found #{count} records"
